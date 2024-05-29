@@ -1,8 +1,4 @@
-from django.shortcuts import render
-from django.http import HttpResponse
 from django.http import JsonResponse
-from django.db.models import Q
-import requests
 from rest_framework.views import APIView
 from rest_framework import viewsets
 from rest_framework.response import Response
@@ -11,14 +7,14 @@ from .serializer import PageInfoSerializer
 import uuid
 import json
 from .models import request_details, url_details
-import asyncio
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from rest_framework.pagination import PageNumberPagination
 from django.core.serializers import serialize
 from .serializer import  UrlDataSerializer
 from WebScraper.tasks import background_work
-import time
+import validators
 
+# Takes in a single URL and returns the title, summary and links as response for the same
 
 class SummarizeAPIView(APIView):
     def generate_unique_id(self):
@@ -26,10 +22,10 @@ class SummarizeAPIView(APIView):
     
     def get(self,requests):
         
-        response_res=[]
         url = requests.GET.get('url')        
-        request_id_=self.generate_unique_id()        
+        request_id_=self.generate_unique_id() 
 
+        
         request_details(request_id=request_id_, no_urls_requested=1, no_urls_suubmitted=1, status='In progress')
 
         WebScraper=WebScrapermodel(url)
@@ -41,7 +37,7 @@ class SummarizeAPIView(APIView):
             summary_ = WebScraper.summarization()  
             links_ = WebScraper.extract_link()
 
-            url_details.objects.create(request_ids = request_id_, urls = url_link, title = title_ ,summary = summary_ ,links = links_ ,status = "SUCCESS")
+            url_details.objects.create(request_ids = request_id_, urls = url_link, title = title_ ,summary = summary_ ,links = links_ ,status = "Success")
         
         
         request_details.objects.update(status="Success")        
@@ -49,7 +45,9 @@ class SummarizeAPIView(APIView):
         url_data = url_details.objects.filter(request_ids=request_id_).values('request_ids','title','summary','links').first()
 
         return JsonResponse(url_data, safe=False) 
+    
 
+# A bulk of URLs is processed in batches by Celery and respondss with a message, request_id and status
 
 class BulkCrawlAPIView(APIView):
     def generate_unique_id(self):
@@ -59,61 +57,64 @@ class BulkCrawlAPIView(APIView):
 
         print('recieved request. foreground work started')
 
-        response={}
+        response={} 
+        is_last_batch=False       
         status_='In progress'
 
         mydata = json.loads(requests.body)
         print(mydata)
-        urls  = mydata.get('urls')  
+        urls  = mydata.get('urls')
 
-        request_id_=self.generate_unique_id()
-        response = ({'message': 'Success. Crawling initiated successfully',
-                    'request_id':request_id_,
-                    'status':status_})   
-             
-        # updating  request_id and status in REQUEST_details table
-        request_det_obj = request_details(request_id=request_id_, no_urls_requested=len(urls), no_urls_suubmitted=len(urls), status=status_)
-        request_det_obj.save()
+        valid_urls = list(set(url for url in urls if validators.url(url)))
 
-        # request_details.objects.update(status="In progress")
-        batches=[]
-        no_batches=10
-        batch_size = len(urls)//no_batches
-        no_extra_urls=len(urls) % no_batches
-        extra=urls[(len(urls) - no_extra_urls):]     
-
-        if len(urls)<=10:
-            background_work.delay(request_id_,urls) 
-
-        else:
-            for i in range(0, len(urls), batch_size):
-                batches.append(urls[i:i + batch_size]) 
-            
-            for batch in batches:
-                print(request_id_)
-                background_work.delay(request_id_,batch)
+        if not urls:
+            return Response('URL does not exist')        
         
-        # time.sleep(30)
-        # request_details.objects.update(status="Success") 
+        else:
+            request_id_=self.generate_unique_id()
+            response = ({'message': 'Success. Crawling initiated successfully',
+                        'request_id':request_id_,
+                        'status':status_})   
+                
+            request_det_obj = request_details(request_id=request_id_, no_urls_requested=len(valid_urls), no_urls_suubmitted=len(valid_urls), status=status_)
+            request_det_obj.save()
 
-        print('after filling fields')
+            batches=[]
+            no_batches=10
+            batch_size = len(valid_urls)//no_batches
+            no_extra_urls=len(valid_urls) % no_batches
+            extra=urls[(len(valid_urls) - no_extra_urls):] 
 
-        return JsonResponse(response) 
+            if len(valid_urls)<=10: 
+                is_last_batch=True              
+                background_work.delay(request_id_, valid_urls, is_last_batch) 
+
+            else:
+                for i in range(0, len(valid_urls), batch_size):
+                    batches.append(valid_urls[i:i + batch_size]) 
+                
+                for index,batch in enumerate(batches):   
+
+                    if index==len(batches)-1:
+                        is_last_batch=True
+              
+                    background_work.delay(request_id_, batch, is_last_batch)
+
+            print('after filling fields')
+
+            return JsonResponse(response) 
     
     
+#Responds with the title, summary and links for the URLs sent
+
 class ResultAPIViews(APIView):
     
     def get(self,requests): 
 
         response_res=[]
         req_id = requests.GET.get('request_id')
-        print(req_id)
         
         request_details_data = request_details.objects.get(request_id=req_id)
-        print(request_details_data.request_id)     
-
-        # if request_details_data.status=='In progress':
-        #     return Response({'status':'In progress'})  
                 
         if request_details_data.status=='Success':
             url_data = url_details.objects.filter(request_ids=req_id) 
@@ -131,12 +132,11 @@ class ResultAPIViews(APIView):
             return JsonResponse(response_res,safe=False) 
         else:
             return Response({'status':'In progress'})
-
-        
         
 
-#PageNumberPagination() provides a way to paginate querysets, meaning it can split a large set of results into manageable pages
-#paginate_queryset method processes the queryset according to the pagination settings and the current request. It splits the queryset into pages and returns only the items for the current page, based on the page parameter in the request UR
+# PageNumberPagination() provides a way to paginate querysets, meaning it can split a large set of results into manageable pages
+# paginate_queryset method processes the queryset according to the pagination settings and the current request. It splits the queryset into pages and returns only the items for the current page, based on the page parameter in the request UR
+
 class ReportAPIViews(APIView):
      
      def get(self,requests):
@@ -152,4 +152,3 @@ class ReportAPIViews(APIView):
         serializer = UrlDataSerializer(result,many=True)   
        
         return paginator.get_paginated_response(serializer.data)
-       
