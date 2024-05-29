@@ -5,73 +5,48 @@ import asyncio
 from asgiref.sync import async_to_sync
 from celery import Celery
 import time
-
-# async def task_work(request_id, batch, delay=1):
-#     for url in batch:
-#         WebScraper = WebScrapermodel(url)
-#         resp = WebScraper.get_response()
-
-#         print('response of WebScraper.get_response in views is: ', resp)
-#         if resp is not None:
-#             url_link = url
-#             title_ = WebScraper.extract_title()
-#             summary_ = WebScraper.summarization()
-#             links_ = WebScraper.extract_link()
-
-#             url_details.objects.create(request_ids=request_id, urls=url_link, title=title_, summary=summary_, links=links_, status="SUCCESS")
-
-#         # Introduce a delay between processing each URL
-#         await asyncio.sleep(delay)
-
+from urllib.parse import quote
 
 @shared_task
-def background_work(request_id_, urls):
+def background_work(request_id_, urls, is_last_batch):
 
-    print('background work has started')    
-
-    success_count = 0  
-    failed_count = 0
-    
-    # updating request_id and status in url_details table              
+    print('background work has started')       
+            
     for url in urls: 
 
-        time.sleep(10)           
-                
+        time.sleep(2) 
+        
+        url_det_obj = url_details(request_ids=request_id_, urls=url,status='In Progress')
+        url_det_obj.save()
+
+    for url in urls:
         webScraper=WebScrapermodel(url)
         resp = webScraper.get_response()
 
-        print('response of WebScraper.get_response in views is: ',resp)
         if resp != None:
             url_link=url
             title_= webScraper.extract_title()
             summary_ = webScraper.summarization()  
             links_ = webScraper.extract_link()
 
-            # url_details.objects.create(request_ids=request_id_, urls=url_link, title=title_ , summary=summary_ , links=links_ , status="SUCCESS")
+            url_details.objects.filter(request_ids = request_id_, urls = url_link).update(title=title_, summary=summary_ , links=links_ , status="Success")      
+        else:
+            url_details.objects.filter(request_ids = request_id_, urls = url_link).update(status = "Failed")
 
-        if title_ and summary_ and links_:
-            url_details.objects.create(request_ids=request_id_, urls=url_link, title=title_ , summary=summary_ , links=links_ , status="Success")
-            success_count+=1
+    if is_last_batch:
+
+        url_details_status = url_details.objects.filter(request_ids = request_id_).values_list('status', flat = True)
+
+        if all(status == 'Success' for status in url_details_status):
+            request_details_status = 'Success'
+
+        elif any(status == 'Failed' for status in url_details_status):
+            request_details_status = 'Partial Success'
 
         else:
-            url_details.objects.create(request_ids=request_id_, urls=url_link, title=title_ , summary=summary_ , links=links_ , status="Failed")
-            failed_count+=1
+            request_details_status='In Prog'
 
-    
-    request_details_obj = request_details.objects.get(request_id = request_id_)
+        request_details.objects.filter(request_id = request_id_).update(status = request_details_status)
 
-    print(success_count)
-    print(failed_count)
-
-    if failed_count>0 and success_count>0:
-        request_details_obj.status= 'Partial Success' 
-
-    elif failed_count>0:
-        request_details_obj.status= 'Failed'
-        
-    else:
-        request_details_obj.status= 'Success'
-
-    request_details_obj.save()
-
-    print('background work has ended')  
+    print('background work has ended')
+  
